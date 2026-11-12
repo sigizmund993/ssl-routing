@@ -6,7 +6,7 @@ sampling::assess. Чтобы добавить метод, напиши функ�
 runSlsqp() повторяет minimize() из include/minimizing/minimize.h, но без отрисовки и с замером времени.
 Если меняешь настройку nlopt в minimize(), поменяй и здесь.
 
-Запуск: ./bench-app [число сцен = 1000] [seed = 42] [режим = normal | tight | moving] [номер сцены для подробного вывода]
+Запуск: ./bench-app [число сцен = 1000] [seed = 42] [режим = normal | tight | moving | file (сцены из файла SCENES)] [номер сцены для подробного вывода]
 */
 #include <random>
 #include <vector>
@@ -342,6 +342,40 @@ Scene movingScene(mt19937 &gen)
     return s;
 }
 
+// сцены из файла (например, нарезанные из логов игр): по строке на сцену
+// start.x start.y vStart.x vStart.y end.x end.y vEnd.x vEnd.y n, затем n раз x y rad vx vy. Единицы мм, мм/с
+vector<Scene> loadScenes(const char *path)
+{
+    vector<Scene> scenes;
+    FILE *f = fopen(path, "r");
+    if (!f)
+    {
+        fprintf(stderr, "не открыть файл сцен %s\n", path);
+        exit(1);
+    }
+    Scene s;
+    double v[8];
+    while (fscanf(f, "%lf %lf %lf %lf %lf %lf %lf %lf %d", v, v + 1, v + 2, v + 3, v + 4, v + 5, v + 6, v + 7, &s.nEnemies) == 9)
+    {
+        s.start = Point(v[0], v[1]);
+        s.vStart = Point(v[2], v[3]);
+        s.end = Point(v[4], v[5]);
+        s.vEnd = Point(v[6], v[7]);
+        if (s.nEnemies > MAX_ROBOT_COUNT)
+            s.nEnemies = MAX_ROBOT_COUNT;
+        for (int i = 0; i < s.nEnemies; i++)
+        {
+            double x, y, r, vx, vy;
+            if (fscanf(f, "%lf %lf %lf %lf %lf", &x, &y, &r, &vx, &vy) != 5)
+                break;
+            s.enemies[i] = AbsRigBody(Point(x, y), r, Point(vx, vy));
+        }
+        scenes.push_back(s);
+    }
+    fclose(f);
+    return scenes;
+}
+
 bool straightBlocked(const Scene &s)
 {
     Point prod[2];
@@ -413,6 +447,19 @@ int main(int argc, char **argv)
     unsigned seed = argc > 2 ? atoi(argv[2]) : 42;
     const char *mode = argc > 3 ? argv[3] : "normal";
     bool tight = strcmp(mode, "tight") == 0, moving = strcmp(mode, "moving") == 0;
+    // режим file: сцены из файла, путь в переменной окружения SCENES
+    bool fromFile = strcmp(mode, "file") == 0;
+    vector<Scene> fileScenes;
+    if (fromFile)
+    {
+        if (!getenv("SCENES"))
+        {
+            fprintf(stderr, "режим file: задай путь к сценам в SCENES\n");
+            return 1;
+        }
+        fileScenes = loadScenes(getenv("SCENES"));
+        nScenes = min(nScenes, int(fileScenes.size()));
+    }
     int detailIdx = argc > 4 ? atoi(argv[4]) : -1;
     mt19937 gen(seed);
     if (getenv("BUDGET"))
@@ -427,6 +474,14 @@ int main(int argc, char **argv)
         samplerParams.randomShare = atof(getenv("RANDOM_SHARE"));
     if (getenv("PREDICT"))
         samplerParams.predictTangents = atoi(getenv("PREDICT")) != 0;
+    if (getenv("HORIZON"))
+        samplerParams.horizon = atof(getenv("HORIZON"));
+    if (getenv("ACCEL"))
+        samplerParams.accel = atof(getenv("ACCEL"));
+    if (getenv("DECEL"))
+        samplerParams.decel = atof(getenv("DECEL"));
+    if (getenv("BRAKE"))
+        samplerParams.emergencyBrake = atoi(getenv("BRAKE")) != 0;
     if (getenv("NM"))
         samplerParams.nelderMead = atoi(getenv("NM")) != 0;
     if (getenv("NM_STEP_POS"))
@@ -460,14 +515,14 @@ int main(int argc, char **argv)
     double worstMiss = 0;
     int worstIdx = -1;
     // статистика перебора и доводки
-    int samplerInfeasible = 0, samplerDirect = 0, samplerNotFound = 0, refineAccepted = 0;
+    int samplerInfeasible = 0, samplerDirect = 0, samplerNotFound = 0, refineAccepted = 0, samplerBrake = 0;
     vector<double> refineGain, refineTime, refineEvals, samplerTried;
     int rejectMiss = 0, rejectClearance = 0, rejectClearanceSmall = 0, rejectNoGain = 0;
     double maxConvMiss = 0, maxConvDT = 0;
 
     for (int k = 0; k < nScenes; k++)
     {
-        Scene s = tight ? tightScene(gen) : moving ? movingScene(gen) : randomScene(gen);
+        Scene s = fromFile ? fileScenes[k] : tight ? tightScene(gen) : moving ? movingScene(gen) : randomScene(gen);
         blocked += straightBlocked(s);
         for (int m = 0; m < nMethods; m++)
         {
@@ -500,6 +555,7 @@ int main(int argc, char **argv)
             if (methods[m].run == runSampler)
             {
                 samplerInfeasible += !samplerInfo.result.feasible;
+                samplerBrake += samplerInfo.result.brake;
                 samplerDirect += samplerInfo.result.direct;
                 samplerNotFound += !samplerInfo.result.found;
                 samplerTried.push_back(samplerInfo.result.nTried);
@@ -555,7 +611,7 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("сцен: %d (seed %u, режим %s), прямая start-end перекрыта препятствием в %d\n", nScenes, seed, tight ? "tight" : moving ? "moving" : "normal", blocked);
+    printf("сцен: %d (seed %u, режим %s), прямая start-end перекрыта препятствием в %d\n", nScenes, seed, mode, blocked);
 
     // ---- минимизатор, как раньше ----
     auto row = [&](const char *name, const vector<double> &v)
@@ -584,13 +640,13 @@ int main(int argc, char **argv)
     // ---- все методы, общая оценка ----
     printf("\n== все методы, общая оценка (sampling::assess) ==\n");
     pad("метод", 18);
-    const char *cols[] = {"t ср, мс", "медиана", "p95", "max", "T ср, с", "недопуст.", "промах>50", "зазор<0", "зазор<SAFE"};
+    const char *cols[] = {"t ср, мс", "медиана", "p95", "max", "T ср, с", "недопуст.", "промах>50", "зазор<0", "зазор<SAFE", "<0 за 1 с"};
     for (const char *h : cols)
         pad(h, 11, true);
     printf("\n");
     for (int m = 0; m < nMethods; m++)
     {
-        int invalid = 0, miss = 0, inside = 0, unsafe = 0;
+        int invalid = 0, miss = 0, inside = 0, unsafe = 0, insideH = 0;
         vector<double> T;
         for (const sampling::Quality &q : quality[m])
         {
@@ -598,13 +654,15 @@ int main(int argc, char **argv)
             miss += q.miss > 50;
             inside += q.clearance < 0;
             unsafe += q.violation > 1e-6;
+            insideH += q.clearanceH < 0;
             T.push_back(q.T);
         }
         pad(methods[m].name, 18);
-        printf("%11.3f%11.3f%11.3f%11.3f%11.3f%11d%11d%11d%11d\n", mean(times[m]), percentile(times[m], .5), percentile(times[m], .95),
-               percentile(times[m], 1), mean(T), invalid, miss, inside, unsafe);
+        printf("%11.3f%11.3f%11.3f%11.3f%11.3f%11d%11d%11d%11d%11d\n", mean(times[m]), percentile(times[m], .5), percentile(times[m], .95),
+               percentile(times[m], 1), mean(T), invalid, miss, inside, unsafe, insideH);
     }
-    printf("недопуст. = промах > 50 мм или зазор < 0; зазор<SAFE = зазор меньше требуемого (SAFE_DIST либо зазор в start/end, если он меньше)\n");
+    printf("недопуст. = промах > 50 мм или зазор < 0; зазор<SAFE = зазор меньше требуемого (SAFE_DIST либо зазор в start/end, если он меньше);\n"
+           "<0 за 1 с = зазор < 0, если движущиеся препятствия проверять только первую секунду (горизонт перебора)\n");
 
     // ---- сравнение T с базой на сценах, где оба метода допустимы ----
     printf("\n== T относительно %s (только сцены, где оба допустимы; «быстрее» = разница T больше 0.5 %%) ==\n", methods[0].name);
@@ -651,8 +709,8 @@ int main(int argc, char **argv)
         }
     }
     printf("\n== перебор ==\n");
-    printf("прямая траектория свободна: %d, недопустимо по собственной оценке: %d, ничего не построилось: %d\n", samplerDirect, samplerInfeasible,
-           samplerNotFound);
+    printf("прямая траектория свободна: %d, недопустимо по собственной оценке: %d, ничего не построилось: %d, аварийное торможение: %d\n",
+           samplerDirect, samplerInfeasible, samplerNotFound, samplerBrake);
     printf("бюджет %d; кандидатов за вызов: среднее %.1f, max %.0f\n", samplerParams.budget, mean(samplerTried), percentile(samplerTried, 1));
     printf("сцены, где у перебора зазор меньше требуемого:");
     for (int k = 0, shown = 0; k < nScenes && shown < 20; k++)

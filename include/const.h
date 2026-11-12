@@ -4,8 +4,13 @@
 #pragma once
 
 //robot movement
+// MAX_VEL и MAX_ACC можно переопределить при сборке (-DMAX_VEL=... -DMAX_ACC=...), например под роботов из логов игр
+#ifndef MAX_VEL
 #define MAX_VEL 1000
+#endif
+#ifndef MAX_ACC
 #define MAX_ACC 2000
+#endif
 #define SAFE_DIST 20
 //idk
 #define MAX_ROBOT_COUNT 16

@@ -127,6 +127,15 @@ namespace sampling
         int directShare = 20;        // сколько кандидатов потратить на поиск рядом со свободной прямой траекторией
         bool nelderMead = true;      // уточнение Нелдером–Мидом по (P, vP) вместо случайного шума
         bool predictTangents = true; // касательные точки строятся к прогнозу положения движущихся препятствий
+        // с: движущиеся препятствия проверяются только до этого момента траектории. Прогноз «постоянная скорость»
+        // дальше ~0.5–1 с почти бесполезен (логи игр: ошибка через 1 с — 0.3 м в медиане, 1 м в p90),
+        // а план всё равно пересчитывается каждый кадр. Неподвижные препятствия проверяются на всём пути
+        double horizon = 1.0;
+        // мм/с²: ускорение на разгоне и на торможении. Реальные роботы тормозят в 1.5–2 раза резче, чем
+        // разгоняются (логи игр). По умолчанию оба равны MAX_ACC — симметричный bang-bang, как у минимизатора
+        double accel = MAX_ACC;
+        double decel = MAX_ACC;
+        bool emergencyBrake = true;  // нет допустимой траектории — тормозить, если это не хуже лучшего кандидата
         double nmStepPos = 200;      // мм: начальный шаг симплекса по P (у свободной прямой вдвое меньше)
         double nmStepVel = 400;      // мм/с: начальный шаг симплекса по vP
         double maxResidual = 1;      // мм: допустимая невязка конечной точки bang-bang
@@ -144,6 +153,7 @@ namespace sampling
         double clearance; // минимальный зазор до препятствий (расстояние до центра минус радиус), мм
         double miss;      // промах мимо конечной точки, мм
         double violation; // на сколько мм нарушен требуемый зазор (<= 0, если всё в порядке)
+        double clearanceH; // зазор, если движущиеся препятствия проверять только до горизонта (неподвижные — весь путь)
     };
 
     struct Result
@@ -152,6 +162,7 @@ namespace sampling
         bool found = false;    // построилась хоть одна траектория
         bool feasible = false; // зазор не меньше требуемого
         bool direct = false;   // прямая траектория без промежуточной точки
+        bool brake = false;    // допустимой траектории нет, вместо неё аварийное торможение
         Point P, vP;           // промежуточное состояние (если !direct)
         BangPart parts[2];
         int nParts = 0;
@@ -189,6 +200,18 @@ namespace sampling
         return sqrt(best) - rad;
     }
 
+    // зазор участка с учётом горизонта: движущееся препятствие проверяется только до момента horizon
+    double horizonClearance(const Segment &s, const Point &pos, const Point &vel, double rad, double horizon)
+    {
+        if (vel.mag2() == 0 || s.t0 + s.dur <= horizon)
+            return segmentClearance(s, pos, vel, rad);
+        if (s.t0 >= horizon)
+            return 1e18;
+        Segment cut = s;
+        cut.dur = horizon - s.t0;
+        return segmentClearance(cut, pos, vel, rad);
+    }
+
     // требуемый зазор до препятствия: SAFE_DIST, но не больше, чем зазор в начальной и конечной точках.
     // Иначе при старте или цели вплотную к препятствию допустимых траекторий не было бы вообще.
     // Положение препятствия для конечной точки берётся на t = 0.
@@ -204,7 +227,7 @@ namespace sampling
     // препятствия, сдвинутые туда, где они будут, когда робот поравняется с ними на отрезке start→end.
     // Время оценивается по проекции на отрезок и средней скорости 0.7·MAX_VEL (три итерации, не больше 3 с).
     // Для неподвижных препятствий это их текущее положение
-    void predictObstacles(const Point &start, const Point &end, const AbsRigBody *enemies, int nEnemies, AbsRigBody *out)
+    void predictObstacles(const Point &start, const Point &end, const AbsRigBody *enemies, int nEnemies, AbsRigBody *out, double horizon = 3)
     {
         Point line = end - start;
         double len = line.mag();
@@ -216,7 +239,7 @@ namespace sampling
                 for (int it = 0; it < 3; it++)
                 {
                     double along = max(0.0, min(len, (p - start) ^ dir));
-                    double t = min(3.0, along / (0.7 * MAX_VEL));
+                    double t = min(min(3.0, horizon), along / (0.7 * MAX_VEL));
                     p = pos + vel * t;
                 }
             out[k] = AbsRigBody(p, enemies[k].getRad(), vel);
@@ -225,7 +248,8 @@ namespace sampling
 
     // зазор и нарушение по всей траектории. Если cap > 0, препятствия заведомо дальше cap пропускаются,
     // а зазор обрезается сверху значением cap (для перебора точнее не надо)
-    void clearanceOf(const Trajectory &tr, const AbsRigBody *enemies, int nEnemies, const double *required, double cap, double &clearance, double &violation)
+    void clearanceOf(const Trajectory &tr, const AbsRigBody *enemies, int nEnemies, const double *required, double cap, double &clearance, double &violation,
+                     double horizon = 1e18)
     {
         clearance = cap > 0 ? cap : 1e18;
         violation = -1e18;
@@ -243,7 +267,7 @@ namespace sampling
                     if (low >= best)
                         continue;
                 }
-                best = min(best, segmentClearance(s, pos, vel, rad));
+                best = min(best, horizonClearance(s, pos, vel, rad, horizon));
             }
             if (tr.n == 0)
                 best = min(best, (tr.startPos - pos).mag() - rad);
@@ -281,14 +305,14 @@ namespace sampling
                 double low = (s.r0 - (pos + vel * s.t0)).mag() - rad - (vMax + vel.mag()) * s.dur;
                 if (need - low <= deficit)
                     continue;
-                deficit = max(deficit, need - segmentClearance(s, pos, vel, rad));
+                deficit = max(deficit, need - horizonClearance(s, pos, vel, rad, params.horizon));
             }
         }
         return deficit;
     }
 
     // оценка траектории любого метода: время, точный зазор, промах (интегрированием участков), нарушение зазора
-    Quality assess(const Trajectory &tr, const Point &endPos, const AbsRigBody *enemies, int nEnemies)
+    Quality assess(const Trajectory &tr, const Point &endPos, const AbsRigBody *enemies, int nEnemies, double horizon = 1.0)
     {
         Quality q;
         double required[nEnemies + 1];
@@ -305,6 +329,8 @@ namespace sampling
         if (!std::isfinite(q.miss))
             q.miss = 1e18;
         clearanceOf(tr, enemies, nEnemies, required, -1, q.clearance, q.violation);
+        double violationH;
+        clearanceOf(tr, enemies, nEnemies, required, -1, q.clearanceH, violationH, horizon);
         return q;
     }
 
@@ -321,7 +347,20 @@ namespace sampling
                 *part = {v0, v0, v1, 0, 0, 0};
             return true;
         }
-        Vm = bangBang::bangBang(v0, v1, dr, MAX_ACC, MAX_VEL, 10, 10, 2, params.barrier);
+        const bool asym = params.decel != params.accel;
+        // ускорение фазы from→to (скорость меняется по прямой): чистый разгон — accel, чистое торможение —
+        // decel, между ними плавно по тому, насколько фаза меняет модуль скорости. Плавность нужна Ньютону
+        auto phaseAcc = [&](const Point &from, const Point &to)
+        {
+            if (!asym)
+                return params.accel;
+            double dv = (to - from).mag();
+            if (dv < 1e-9)
+                return params.accel;
+            double c = max(-1.0, min(1.0, (to.mag() - from.mag()) / dv));
+            return params.decel + (params.accel - params.decel) * (c + 1) / 2;
+        };
+        Vm = bangBang::bangBang(v0, v1, dr, params.accel, MAX_VEL, 10, 10, 2, params.barrier);
         if (!std::isfinite(Vm.x) || !std::isfinite(Vm.y))
             return false;
         double vm = Vm.mag();
@@ -329,11 +368,37 @@ namespace sampling
             return false;
         auto remainder = [&](const Point &V)
         {
-            ta = (V - v0).mag() / MAX_ACC;
-            td = (v1 - V).mag() / MAX_ACC;
+            ta = (V - v0).mag() / phaseAcc(v0, V);
+            td = (v1 - V).mag() / phaseAcc(V, v1);
             return dr - (v0 + V) * (ta / 2) - (v1 + V) * (td / 2);
         };
         rem = remainder(Vm);
+        if (asym && rem.mag() > 1e-3 && vm < MAX_VEL * 0.999)
+        {
+            // bangBang решал симметричную задачу; с разными ускорениями доводим Vm Ньютоном с численным якобианом.
+            // Если Vm вышла за MAX_VEL, дальше работает ветка с РПД
+            for (int it = 0; it < 30 && rem.mag() > 1e-3; it++)
+            {
+                const double h = 1e-2;
+                Point fx = (remainder(Vm + Point(h, 0)) - remainder(Vm - Point(h, 0))) / (2 * h);
+                Point fy = (remainder(Vm + Point(0, h)) - remainder(Vm - Point(0, h))) / (2 * h);
+                double det = fx.x * fy.y - fy.x * fx.y;
+                if (!(abs(det) > 1e-12))
+                    break;
+                Point d((-rem.x * fy.y + fy.x * rem.y) / det, (-fx.x * rem.y + rem.x * fx.y) / det);
+                if (d.mag() > 500)
+                    d = d * (500 / d.mag());
+                Vm = Vm + d;
+                if (Vm.mag() > MAX_VEL)
+                {
+                    Vm = Vm * (MAX_VEL / Vm.mag());
+                    rem = remainder(Vm);
+                    break;
+                }
+                rem = remainder(Vm);
+            }
+            vm = Vm.mag();
+        }
         if (rem.mag() > 1e-3)
         {
             // остаток пути проезжается на РПД, для этого Vm должна лежать на окружности Vmax и смотреть вдоль остатка.
@@ -525,7 +590,7 @@ namespace sampling
         auto consider = [&](bool direct, const Point &P, const Point &vP)
         {
             double clearance, violation;
-            clearanceOf(traj, enemies, nEnemies, required, params.margin, clearance, violation);
+            clearanceOf(traj, enemies, nEnemies, required, params.margin, clearance, violation, params.horizon);
             bool feasible = violation <= 1e-6;
             double T = traj.duration();
             double deficit = params.penalty > 0 ? marginDeficit(traj, enemies, nEnemies, params) : 0;
@@ -749,7 +814,7 @@ namespace sampling
             }
             best.nTried = tried;
             double violation;
-            clearanceOf(best.traj, enemies, nEnemies, required, -1, best.clearance, violation);
+            clearanceOf(best.traj, enemies, nEnemies, required, -1, best.clearance, violation, params.horizon);
             if (state)
             {
                 state->valid = !best.direct;
@@ -768,7 +833,7 @@ namespace sampling
         // движущиеся препятствия берутся там, где они будут, когда робот поравняется с ними
         AbsRigBody predicted[nEnemies + 1];
         if (params.predictTangents)
-            predictObstacles(start, end, enemies, nEnemies, predicted);
+            predictObstacles(start, end, enemies, nEnemies, predicted, params.horizon);
         else
             for (int k = 0; k < nEnemies; k++)
                 predicted[k] = enemies[k];
@@ -847,7 +912,7 @@ namespace sampling
         {
             // точный зазор итоговой траектории (при переборе он обрезан сверху значением margin)
             double violation;
-            clearanceOf(best.traj, enemies, nEnemies, required, -1, best.clearance, violation);
+            clearanceOf(best.traj, enemies, nEnemies, required, -1, best.clearance, violation, params.horizon);
         }
         else
         {
@@ -858,6 +923,34 @@ namespace sampling
             state->valid = best.found && !best.direct;
             state->P = best.P;
             state->vP = best.vP;
+        }
+        // допустимой траектории нет: аварийное торможение с decel по прямой до остановки, если оно нарушает зазор
+        // не сильнее лучшего кандидата. Тёплый старт остаётся от лучшего кандидата: в следующем кадре путь может
+        // найтись. Торможение не доезжает до цели — это осознанный отказ
+        if (params.emergencyBrake && (!best.found || !best.feasible))
+        {
+            Trajectory brake;
+            brake.reset(start, vStart);
+            double speed = vStart.mag();
+            if (speed > 1e-6)
+                brake.append(speed / params.decel, vStart * (-params.decel / speed));
+            double clearance, violation;
+            clearanceOf(brake, enemies, nEnemies, required, -1, clearance, violation, params.horizon);
+            // тормозим, только если лучший кандидат действительно задевает препятствие (зазор < 0), а не просто
+            // проходит ближе SAFE_DIST, и торможение нарушает зазор не сильнее
+            if (!best.found || (best.clearance < 0 && violation <= best.violation + 1e-9))
+            {
+                best.traj = brake;
+                best.found = true;
+                best.brake = true;
+                best.direct = false;
+                best.feasible = violation <= 1e-6;
+                best.nParts = 0;
+                best.T = brake.duration();
+                best.clearance = clearance;
+                best.violation = violation;
+                best.cost = best.T;
+            }
         }
         return best;
     }
