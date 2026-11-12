@@ -16,14 +16,15 @@ $(TARGET): $(SRC) $(HEADERS)
 run: $(TARGET)
 	./$(TARGET)
 
-# бенчмарк минимизации на случайных сценах: make bench N=1000 SEED=42
+# бенчмарк планировщиков на случайных сценах: make bench N=1000 SEED=42 MODE=normal (или tight, moving)
 N    ?= 1000
 SEED ?= 42
+MODE ?= normal
 bench-app: bench.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) bench.cpp -o bench-app $(LIBS)
 
 bench: bench-app
-	./bench-app $(N) $(SEED)
+	./bench-app $(N) $(SEED) $(MODE)
 
 clean:
 	rm -f $(TARGET) bench-app
