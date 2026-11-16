@@ -8,6 +8,10 @@
 
 using namespace std;
 
+// NO_WINDOW (задаётся до подключения заголовков): отрисовки нет вообще, окно не создаётся и к дисплею программа не
+// обращается. Нужен программам без отрисовки (bench.cpp и всё, что его подключает): metrics.h тянет этот заголовок,
+// и иначе каждый их запуск открывал бы окно
+#ifndef NO_WINDOW
 namespace drawer
 {
     double k_draw = min(double(PIXELS_X) / FIELD_DX, double(PIXELS_Y) / FIELD_DY);
@@ -134,3 +138,4 @@ namespace drawer
         drawLine(p, p + v * VELOCITY_K, w, sf::Color(128, 0, 255));
     }
 }
+#endif

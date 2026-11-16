@@ -8,6 +8,8 @@ runSlsqp() повторяет minimize() из include/minimizing/minimize.h, н�
 
 Запуск: ./bench-app [число сцен = 1000] [seed = 42] [режим = normal | tight | moving | file (сцены из файла SCENES)] [номер сцены для подробного вывода]
 */
+// бенчмарк ничего не рисует: окно SFML не открываем (см. drawer.h)
+#define NO_WINDOW
 #include <random>
 #include <vector>
 #include <algorithm>
@@ -482,6 +484,14 @@ int main(int argc, char **argv)
         samplerParams.decel = atof(getenv("DECEL"));
     if (getenv("BRAKE"))
         samplerParams.emergencyBrake = atoi(getenv("BRAKE")) != 0;
+    if (getenv("TWO_VIA"))
+        samplerParams.twoVia = atoi(getenv("TWO_VIA")) != 0;
+    if (getenv("ANALYTIC"))
+        samplerParams.analyticJacobian = atoi(getenv("ANALYTIC")) != 0;
+    if (getenv("TWO_VIA_SHARE"))
+        samplerParams.twoViaShare = atof(getenv("TWO_VIA_SHARE"));
+    if (getenv("HARD_EXTRA"))
+        samplerParams.hardExtra = atoi(getenv("HARD_EXTRA"));
     if (getenv("NM"))
         samplerParams.nelderMead = atoi(getenv("NM")) != 0;
     if (getenv("NM_STEP_POS"))
@@ -598,6 +608,10 @@ int main(int argc, char **argv)
                 }
                 pad(methods[m].name, 18);
                 printf("T %.3f с, зазор %.1f мм, промах %.2f мм, участков %d\n", q.T, q.clearance, q.miss, out.traj.n);
+                if (methods[m].run == runSampler)
+                    printf("  вид %d, торможение %d, допустим %d, нарушение %.1f, P2 (%.0f, %.0f)\n", samplerInfo.result.kind,
+                           samplerInfo.result.brake, samplerInfo.result.feasible, samplerInfo.result.violation, samplerInfo.result.P2.x,
+                           samplerInfo.result.P2.y);
                 if (methods[m].run == runSampler && !samplerInfo.result.direct)
                     printf("  P (%.0f, %.0f), vP (%.0f, %.0f)\n", samplerInfo.result.P.x, samplerInfo.result.P.y, samplerInfo.result.vP.x,
                            samplerInfo.result.vP.y);
@@ -712,6 +726,11 @@ int main(int argc, char **argv)
     printf("прямая траектория свободна: %d, недопустимо по собственной оценке: %d, ничего не построилось: %d, аварийное торможение: %d\n",
            samplerDirect, samplerInfeasible, samplerNotFound, samplerBrake);
     printf("бюджет %d; кандидатов за вызов: среднее %.1f, max %.0f\n", samplerParams.budget, mean(samplerTried), percentile(samplerTried, 1));
+    printf("сцены, где перебор недопустим:");
+    for (int k = 0; k < nScenes; k++)
+        if (isInvalid(quality[1][k]))
+            printf(" %d (промах %.0f, зазор %.0f)", k, quality[1][k].miss, quality[1][k].clearance);
+    printf("\n");
     printf("сцены, где у перебора зазор меньше требуемого:");
     for (int k = 0, shown = 0; k < nScenes && shown < 20; k++)
         if (quality[1][k].violation > 1e-6)

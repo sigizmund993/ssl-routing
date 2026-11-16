@@ -6,7 +6,7 @@ SRC      = main.cpp
 # весь код в заголовках, поэтому пересобираем при изменении любого из них
 HEADERS  = $(shell find include -name '*.h')
 
-.PHONY: all run clean init bench
+.PHONY: all run clean init bench multi
 
 all: $(TARGET)
 
@@ -26,8 +26,17 @@ bench-app: bench.cpp $(HEADERS)
 bench: bench-app
 	./bench-app $(N) $(SEED) $(MODE)
 
+# симуляция нескольких своих роботов: make multi N=200 SEED=42 SCENARIO=swap (или random, cross, zone).
+# Библиотеки не нужны: sampler.h не тянет SFML и nlopt
+SCENARIO ?= swap
+multi-app: multi.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) multi.cpp -o multi-app
+
+multi: multi-app
+	./multi-app $(if $(filter 1000,$(N)),200,$(N)) $(SEED) $(SCENARIO)
+
 clean:
-	rm -f $(TARGET) bench-app
+	rm -f $(TARGET) bench-app multi-app
 
 # зависимости для Ubuntu/Debian
 init:
